@@ -818,10 +818,10 @@ function parseBestSellers(rows){
   }
   return { hi, cols, items, last:items.length ? items[items.length - 1].row : hi + 1 };
 }
-/* ATS split for the Best Sellers form: 55% TJ Maxx, 45% Marshalls, each rounded up the way the form's own columns do */
+/* ATS split for the Best Sellers form: 55% to TJ Maxx rounded up, the rest (45% rounded down) to Marshalls — the two always add back to the ATS */
 function bsSplit(units){
-  const n = Math.max(0, Math.round(units || 0)), tjm = n * 55 / 100, mar = n * 45 / 100;
-  return { n, tjm, mar, tjmUp:Math.ceil(tjm), marUp:Math.ceil(mar) };
+  const n = Math.max(0, Math.round(units || 0)), tjm = Math.ceil(n * 55 / 100);
+  return { n, tjm, mar:n - tjm };
 }
 /* ===== PURE:END ===== */
 function workerScene() {
@@ -1382,7 +1382,7 @@ async function importPictures(buf, si, byRow, picCol){
 }
 
 /* ============================ BEST SELLERS ========================== */
-/* TJX's weekly Best Sellers form goes back with our ATS in Total units (the form splits it 55% TJ Maxx / 45% Marshalls) and the
+/* TJX's weekly Best Sellers form goes back with our ATS in Total units (split 55% TJ Maxx rounded up / the rest to Marshalls) and the
    highest paid price in Cost. Every other tracked style with ATS is added under TJX's rows. A style ticked ✕ (bsx on the style) stays off. */
 const SS_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 async function stageBest(bs, si, file, buf){
@@ -1425,7 +1425,7 @@ function renderBest(){
     if (x.cost == null && !x.off) notes.push(!isTjx ? "No paid price — cost left blank" : x.tjxCost != null ? "No paid price — TJX's cost kept" : "No paid price");
     return "<tr" + (x.off ? ' class="off"' : "") + '><td class="x"><input type="checkbox" class="bsx" data-k="' + esc(x.k) + '" data-s="' + esc(x.style) + '"' + (x.off ? " checked" : "") +
       ' aria-label="Leave ' + esc(x.style) + ' off the report"></td><td><b>' + esc(x.style) + '</b></td><td class="d" title="' + esc(x.desc) + '">' + esc(x.desc) + "</td>" +
-      '<td class="n a">' + (x.ats == null ? "" : fmt0(x.ats)) + '</td><td class="n">' + (x.off ? "" : fmt0(sp.tjmUp)) + '</td><td class="n">' + (x.off ? "" : fmt0(sp.marUp)) + "</td>" +
+      '<td class="n a">' + (x.ats == null ? "" : fmt0(x.ats)) + '</td><td class="n">' + (x.off ? "" : fmt0(sp.tjm)) + '</td><td class="n">' + (x.off ? "" : fmt0(sp.mar)) + "</td>" +
       '<td class="n">' + (cost != null ? "$" + cost.toFixed(2) : "") + '</td><td class="hint">' + esc(notes.join(" · ")) + "</td></tr>";
   };
   const onT = p.tjx.filter(x => !x.off), onE = p.extra.filter(x => !x.off), offN = p.tjx.length + p.extra.length - onT.length - onE.length;
@@ -1451,7 +1451,7 @@ function setBestOff(k, on, name){
   if (S.drawer === k){ const c = $("#dwBsx"); if (c) c.checked = on; }
   if (S.show === "bsoff") refreshSoon();
 }
-/* Fills TJX's own workbook in place — only the cells we answer change, so their layout, formulas and lookups stay as sent. */
+/* Fills TJX's own workbook in place — only the cells we answer and the two split formulas change, so their layout and lookups stay as sent. */
 async function buildBest(){
   const b = S.bs, p = bestPlan(), C = b.cols, X = XLSX.utils;
   const zip = await JSZip.loadAsync(b.buf);
@@ -1492,10 +1492,17 @@ async function buildBest(){
     if (n != null && x.cost != null && C.cost >= 0) putNum(cellAt(rowEl, C.cost, true), x.cost);
     const cost = x.cost != null ? x.cost : x.tjxCost, ec = (cost || 0) * sp.n, er = (retail || 0) * sp.n;
     const calc = (ci, v) => { const c = cellAt(rowEl, ci); if (!fOf(c)) return false; shown(c, v); return true; };
-    // no split formulas on the form → write the split as plain units
-    if (!calc(C.tjm, sp.tjm) && C.tjm >= 0 && n != null) putNum(cellAt(rowEl, C.tjm, true), Math.round(sp.tjm));
-    if (!calc(C.mar, sp.mar) && C.mar >= 0 && n != null) putNum(cellAt(rowEl, C.mar, true), sp.n - Math.round(sp.tjm));
-    calc(C.rtjm, sp.tjmUp); calc(C.rmar, sp.marUp); calc(C.extc, ec); calc(C.extr, er);
+    // The form's own split leaves fractions of a unit. Its two formulas become: TJ Maxx = 55% rounded up, Marshalls = the rest.
+    // A formula other rows share is changed in place (they follow it); a row that borrows one gets its own. No formulas on the form → plain units.
+    const rn = rowEl.getAttribute("r"), kRef = X.encode_col(C.units) + rn;
+    const setF = (ci, text, v) => {
+      const c = cellAt(rowEl, ci), f = fOf(c); if (!f) return false;
+      if (!f.getAttribute("ref")) ["t", "si"].forEach(a => f.removeAttribute(a));
+      f.textContent = text; shown(c, v); return true;
+    };
+    if (C.tjm >= 0 && !setF(C.tjm, "ROUNDUP(" + kRef + "*55/100,0)", sp.tjm) && n != null) putNum(cellAt(rowEl, C.tjm, true), sp.tjm);
+    if (C.mar >= 0 && !(C.tjm >= 0 ? setF(C.mar, kRef + "-" + X.encode_col(C.tjm) + rn, sp.mar) : calc(C.mar, sp.mar)) && n != null) putNum(cellAt(rowEl, C.mar, true), sp.mar);
+    calc(C.rtjm, sp.tjm); calc(C.rmar, sp.mar); calc(C.extc, ec); calc(C.extr, er);
     if (er > 0) calc(C.mu, (er - ec) / er);
     ext.set(+rowEl.getAttribute("r"), [ec, er]);
   };
