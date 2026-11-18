@@ -94,6 +94,16 @@ label.fld > span,.lbl{font-size:9.5px;font-weight:700;letter-spacing:.12em;text-
 .strip.ok{background:var(--good-soft);color:var(--good)}
 .strip.err{background:var(--bad-soft);color:var(--bad)}
 .strip input[type=date]{width:auto;padding:6px 10px}
+.bs-list{max-height:440px;overflow:auto;margin-top:8px;border-radius:14px;border:1px solid var(--edge);background:rgba(255,255,255,.55)}
+.bs-t td,.bs-t th{padding:5px 10px}
+.bs-t thead th{position:sticky;top:0;z-index:1;background:rgba(240,245,251,.97)}
+.bs-t tr.bsec td{font-size:9.5px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);background:rgba(233,239,247,.75)}
+.bs-t td.d{max-width:360px;overflow:hidden;text-overflow:ellipsis}
+.bs-t td.x,.bs-t th.x{text-align:center;width:1%}
+.bs-t tr.off td{color:var(--faint)}
+.bs-t tr.off td.a{text-decoration:line-through}
+.bs-t tbody tr:last-child td{border-bottom:none}
+.dw-chk{display:flex;align-items:center;gap:8px;font-size:12.5px;cursor:pointer}
 .busy{display:flex;align-items:center;gap:16px}
 .wk-scene svg{display:block;width:180px;height:auto;overflow:visible}
 .wk-cap{color:var(--warn);font-size:12.5px}
@@ -350,7 +360,7 @@ table.r{border-collapse:separate;border-spacing:0;width:100%;font-size:12.5px}
           <div class="drop" id="drop" tabindex="0" role="button" aria-label="Import a file">
             <span class="arrow">⬆</span>
             <span><b>Drop a file or click to choose</b>
-              <span class="hint">TJX weekly report · TJX info file (category, on hand, incoming) · ERP inventory export · style workbook</span></span>
+              <span class="hint">TJX weekly report · TJX Best Sellers file · TJX info file (category, on hand, incoming) · ERP inventory export · style workbook</span></span>
           </div>
           <div class="asof">
             <label class="fld"><span>Report</span><select id="asOf" class="sm"></select></label>
@@ -381,6 +391,7 @@ table.r{border-collapse:separate;border-spacing:0;width:100%;font-size:12.5px}
               <option value="all">All styles</option><option value="active">With orders</option><option value="openonly">Has open orders</option>
               <option value="new">New this report</option><option value="missing">Missing details</option>
               <option value="reorder">Needs reorder</option><option value="lowre">Reorder or low</option>
+              <option value="bsoff">Off Best Sellers (✕)</option>
             </select>
             <select id="catSel" class="sm"></select>
             <select id="subcatSel" class="sm"></select>
@@ -789,6 +800,29 @@ function tjxPriceHist(snap){
   });
   return M;
 }
+/* TJX Best Sellers order form (header row has "Vendor Style" and "Total units") → { cols, items:[{ row, style, desc, cost, retail }], last }.
+   rows must start at sheet row 1; row / last are sheet row numbers. Returns null for any other sheet. */
+function parseBestSellers(rows){
+  const hi = headerRow(rows, "vendor style"); if (hi < 0) return null;
+  const h = rows[hi], c = n => findCol(h, [n], true);
+  const cols = { style:c("Vendor Style"), units:c("Total units"), fvsn:c("FVSN"), cat:c("Category"), desc:c("Desc"), color:c("Vendor Color"),
+    tjm:c("Units TJM"), mar:c("Units MAR"), rtjm:c("RD UP TJ UNITS"), rmar:c("RD UP MAR UNITS"),
+    cost:c("Cost"), retail:c("Retail"), extc:c("EXT COST"), extr:c("EXT RETAIL"), mu:c("MU%") };
+  if (cols.units < 0) return null;
+  const price = v => { const n = parseFloat(cellStr(v).replace(/[$,\s]/g, "")); return isFinite(n) ? n : null; };
+  const items = [];
+  for (let i = hi + 1; i < rows.length; i++){
+    const r = rows[i]; if (!r) continue;
+    const st = cellStr(r[cols.style]); if (!st) continue;
+    items.push({ row:i + 1, style:st, desc:cols.desc >= 0 ? cellStr(r[cols.desc]) : "", cost:cols.cost >= 0 ? price(r[cols.cost]) : null, retail:cols.retail >= 0 ? price(r[cols.retail]) : null });
+  }
+  return { hi, cols, items, last:items.length ? items[items.length - 1].row : hi + 1 };
+}
+/* ATS split for the Best Sellers form: 55% TJ Maxx, 45% Marshalls, each rounded up the way the form's own columns do */
+function bsSplit(units){
+  const n = Math.max(0, Math.round(units || 0)), tjm = n * 55 / 100, mar = n * 45 / 100;
+  return { n, tjm, mar, tjmUp:Math.ceil(tjm), marUp:Math.ceil(mar) };
+}
 /* ===== PURE:END ===== */
 function workerScene() {
   return `<svg viewBox="0 0 210 100" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -886,7 +920,7 @@ const S = {
   photos:new Map(), full:new Map(),
   year:0, basis:LS.get("basis","start"), cust:"All", measure:LS.get("measure","total"), show:"all", brand:"", q:"",
   sort:{ k:"order", d:1 }, view:null, grpW:{}, armClear:false, qc:new Set(), descW:250, rszDrag:false, rulesOpen:false, exp:null, sel:new Set(), drawer:null,
-  chartMode:LS.get("chart","week"), pending:null, busy:false, armDel:null
+  chartMode:LS.get("chart","week"), pending:null, bs:null, busy:false, armDel:null
 };
 
 /* ============================== MSAL ================================ */
@@ -1128,13 +1162,21 @@ function done(kind, msg){
 }
 async function onFile(file){
   if (!file || S.busy) return;
-  S.pending = null;
+  S.pending = null; S.bs = null;
   busy("Reading " + file.name + "…");
   try {
     if (typeof XLSX === "undefined") throw new Error("Excel library did not load (cdnjs blocked?)");
     const buf = await file.arrayBuffer();
     const wb = XLSX.read(buf, { type:"array" });
     const names = wb.SheetNames;
+    for (let i = 0; i < names.length; i++){
+      const ws = wb.Sheets[names[i]];
+      if (!ws || !ws["!ref"]) continue;
+      const top = XLSX.utils.sheet_to_json(ws, { header:1, raw:true, defval:null, blankrows:true, range:"A1:CZ8" });
+      if (headerRow(top, "vendor style") < 0) continue;
+      const bs = parseBestSellers(XLSX.utils.sheet_to_json(ws, { header:1, raw:true, defval:null, blankrows:true, range:0 }));
+      if (bs) return await stageBest(bs, i, file, buf);
+    }
     const isTjx = names.some(n => {
       const ws = wb.Sheets[n]; if (!ws || !ws["!ref"]) return false;
       const rows = XLSX.utils.sheet_to_json(ws, { header:1, raw:true, defval:null, blankrows:true, range:0 }).slice(0, 8);
@@ -1156,7 +1198,7 @@ async function onFile(file){
       if (hasAts && !hasSub && hdr.some(x => /backlog/i.test(x))) return await importInventory(rows, r0, file, buf, i);
       return await importStyles(ws, rows, r0, file, buf, i, hasAts && (hasSub || hdr.some(x => /total\s*in\s*prod/i.test(x))));
     }
-    throw new Error("Not recognised. Expected the TJX report (Open Orders + Shipped sheets), the inventory export (Style, ATS, Import PO Backlog) or a sheet with a Style column.");
+    throw new Error("Not recognised. Expected the TJX report (Open Orders + Shipped sheets), the TJX Best Sellers file (Vendor Style, Total units), the inventory export (Style, ATS, Import PO Backlog) or a sheet with a Style column.");
   } catch(e){ console.error(e); done("err", file.name + " — " + errMsg(e)); }
 }
 function stageReport(p, fileName){
@@ -1339,6 +1381,198 @@ async function importPictures(buf, si, byRow, picCol){
   return n;
 }
 
+/* ============================ BEST SELLERS ========================== */
+/* TJX's weekly Best Sellers form goes back with our ATS in Total units (the form splits it 55% TJ Maxx / 45% Marshalls) and the
+   highest paid price in Cost. Every other tracked style with ATS is added under TJX's rows. A style ticked ✕ (bsx on the style) stays off. */
+const SS_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+async function stageBest(bs, si, file, buf){
+  const sig = new Uint8Array(buf, 0, 2);
+  if (sig[0] !== 0x50 || sig[1] !== 0x4B) throw new Error("Save the Best Sellers file as .xlsx first — the old .xls format can't be filled in");
+  if (!(S.inv && S.inv.rows)) throw new Error("Load the inventory export or the TJX info file first — there is no ATS to fill in yet");
+  const last = S.index.snaps[S.index.snaps.length - 1];
+  const snap = last ? await getSnap(last.date) : null;
+  S.bs = { file:file.name, buf, si, hi:bs.hi, cols:bs.cols, items:bs.items, last:bs.last,
+           prices:snap ? tjxPriceHist(snap) : new Map(), priceDate:last ? last.date : "", note:"", err:false };
+  S.busy = false;
+  renderBest();
+}
+/* → { tjx:[one per TJX row], extra:[tracked styles with ATS that TJX didn't list, in your order] } */
+function bestPlan(){
+  const b = S.bs, inv = (S.inv && S.inv.rows) || {}, st = S.styles.styles;
+  const loose = new Map(), lk = k => k.replace(/[^A-Z0-9]/g, "");
+  new Set(Object.keys(st).concat(Object.keys(inv))).forEach(k => { const l = lk(k); loose.set(l, (loose.get(l) || []).concat(k)); });
+  // TJX's spelling of a style can differ by a dash or a dot — accept it when exactly one of ours matches
+  const find = s => { const k = nk(s); if (st[k] || inv[k]) return k; const hit = loose.get(lk(k)); return hit && hit.length === 1 ? hit[0] : k; };
+  const line = (k, style, desc) => {
+    const iv = inv[k] || null, s = st[k], p = b.prices.get(k);
+    return { k, style, desc:(s && s.desc) || desc || "", ats:iv ? iv[0] : null, units:bsSplit(iv ? iv[0] : 0).n, cost:p && p.hi ? p.hi.p : null, off:!!(s && s.bsx), known:!!(s || iv) };
+  };
+  const used = new Set();
+  const tjx = b.items.map(it => { const k = find(it.style); used.add(k); return Object.assign(line(k, it.style, it.desc), { row:it.row, tjxCost:it.cost, retail:it.retail }); });
+  const extra = orderKeys(allRows()).filter(k => !used.has(k) && inv[k] && inv[k][0] > 0).map(k => line(k, (st[k] && st[k].style) || k, ""));
+  return { tjx, extra };
+}
+function renderBest(){
+  const b = S.bs, box = $("#impSt"); if (!b) return;
+  const old = box.querySelector(".bs-list"), sT = old ? old.scrollTop : 0;
+  const p = bestPlan();
+  const row = (x, isTjx) => {
+    const sp = bsSplit(x.units), cost = isTjx && (x.off || x.cost == null) ? x.tjxCost : x.cost, notes = [];
+    if (x.off) notes.push(isTjx ? "Marked ✕ — units left blank" : "Marked ✕ — left off");
+    else if (isTjx && !x.known) notes.push("Not in the tracker or the stock file");
+    else if (isTjx && x.ats == null) notes.push("Not in the stock file");
+    else if (isTjx && x.ats <= 0) notes.push("No ATS");
+    if (x.cost == null && !x.off) notes.push(!isTjx ? "No paid price — cost left blank" : x.tjxCost != null ? "No paid price — TJX's cost kept" : "No paid price");
+    return "<tr" + (x.off ? ' class="off"' : "") + '><td class="x"><input type="checkbox" class="bsx" data-k="' + esc(x.k) + '" data-s="' + esc(x.style) + '"' + (x.off ? " checked" : "") +
+      ' aria-label="Leave ' + esc(x.style) + ' off the report"></td><td><b>' + esc(x.style) + '</b></td><td class="d" title="' + esc(x.desc) + '">' + esc(x.desc) + "</td>" +
+      '<td class="n a">' + (x.ats == null ? "" : fmt0(x.ats)) + '</td><td class="n">' + (x.off ? "" : fmt0(sp.tjmUp)) + '</td><td class="n">' + (x.off ? "" : fmt0(sp.marUp)) + "</td>" +
+      '<td class="n">' + (cost != null ? "$" + cost.toFixed(2) : "") + '</td><td class="hint">' + esc(notes.join(" · ")) + "</td></tr>";
+  };
+  const onT = p.tjx.filter(x => !x.off), onE = p.extra.filter(x => !x.off), offN = p.tjx.length + p.extra.length - onT.length - onE.length;
+  box.className = "imp-st show";
+  box.innerHTML = '<div class="strip"><b>TJX Best Sellers</b>' +
+    "<span>" + p.tjx.length + " styles from TJX · " + onT.filter(x => x.units > 0).length + " with ATS</span>" +
+    "<span><b>" + onE.length + "</b> more in-stock styles added below them</span>" +
+    "<span>" + fmt0(onT.concat(onE).reduce((s, x) => s + x.units, 0)) + " units</span>" + (offN ? "<span>" + offN + " marked ✕</span>" : "") +
+    '<span class="hint">Stock ' + fmtD(S.inv.date) + (b.priceDate ? " · highest paid price from the " + fmtD(b.priceDate) + " report" : " · no TJX report saved yet, so no paid prices") + "</span>" +
+    '<div class="spacer"></div><button class="btn sm" id="bsClose">Close</button><button class="btn sm primary" id="bsGo">Download filled file</button></div>' +
+    (b.note ? '<div class="strip ' + (b.err ? "err" : "ok") + '" style="margin-top:8px">' + esc(b.note) + "</div>" : "") +
+    '<div class="bs-list"><table class="mini bs-t"><thead><tr><th class="x" title="Tick to leave a style off the Best Sellers report. It is saved on the style, so it stays off every week until you untick it.">✕ Off</th>' +
+    '<th>Style</th><th>Description</th><th class="n">ATS</th><th class="n">TJ Maxx 55%</th><th class="n">Marshalls 45%</th><th class="n">Cost</th><th></th></tr></thead><tbody>' +
+    '<tr class="bsec"><td colspan="8">On TJX\'s list · ' + p.tjx.length + "</td></tr>" + (p.tjx.map(x => row(x, true)).join("") || '<tr><td colspan="8" class="hint">None.</td></tr>') +
+    '<tr class="bsec"><td colspan="8">Added from the tracker — in stock and not on TJX\'s list · ' + onE.length + "</td></tr>" +
+    (p.extra.map(x => row(x, false)).join("") || '<tr><td colspan="8" class="hint">None.</td></tr>') + "</tbody></table></div>";
+  const nl = box.querySelector(".bs-list"); if (nl) nl.scrollTop = sT;
+}
+function setBestOff(k, on, name){
+  if (!S.styles.styles[k]){ if (!on) return; patch(k, "style", name || k); patch(k, "src", "bestsellers"); patch(k, "added", isoToday()); }
+  patch(k, "bsx", on ? 1 : "");
+  if (S.bs && $("#impSt .bs-list")) renderBest();
+  if (S.drawer === k){ const c = $("#dwBsx"); if (c) c.checked = on; }
+  if (S.show === "bsoff") refreshSoon();
+}
+/* Fills TJX's own workbook in place — only the cells we answer change, so their layout, formulas and lookups stay as sent. */
+async function buildBest(){
+  const b = S.bs, p = bestPlan(), C = b.cols, X = XLSX.utils;
+  const zip = await JSZip.loadAsync(b.buf);
+  const read = async path => { const f = zip.file(path); if (!f) throw new Error("The workbook is missing " + path); return f.async("string"); };
+  const xml = s => { const d = new DOMParser().parseFromString(s, "application/xml"); if (d.getElementsByTagName("parsererror").length) throw new Error("Could not read the workbook"); return d; };
+  const wbx = await read("xl/workbook.xml"), relx = await read("xl/_rels/workbook.xml.rels");
+  const sheet = [...xml(wbx).getElementsByTagNameNS(SS_NS, "sheet")][b.si];
+  const rid = sheet && sheet.getAttributeNS("http://schemas.openxmlformats.org/officeDocument/2006/relationships", "id");
+  const rel = [...xml(relx).getElementsByTagName("Relationship")].find(r => r.getAttribute("Id") === rid);
+  if (!rel) throw new Error("Could not find the sheet inside the workbook");
+  const tgt = rel.getAttribute("Target"), path = tgt.charAt(0) === "/" ? tgt.slice(1) : "xl/" + tgt;
+  const doc = xml(await read(path)), sd = doc.getElementsByTagNameNS(SS_NS, "sheetData")[0];
+  const rowEls = new Map(); [...sd.children].forEach(r => rowEls.set(+r.getAttribute("r"), r));
+  const el = n => doc.createElementNS(SS_NS, n);
+  const colOf = c => X.decode_col(c.getAttribute("r").replace(/\d+/g, ""));
+  const fOf = c => (c && [...c.children].find(x => x.localName === "f")) || null;
+  const cellAt = (rowEl, ci, make) => {
+    if (ci < 0) return null;
+    const cells = [...rowEl.children];
+    let c = cells.find(x => colOf(x) === ci);
+    if (!c && make){ c = el("c"); c.setAttribute("r", X.encode_col(ci) + rowEl.getAttribute("r")); rowEl.insertBefore(c, cells.find(x => colOf(x) > ci) || null); }
+    return c || null;
+  };
+  const wipe = c => { while (c.firstChild) c.removeChild(c.firstChild); c.removeAttribute("t"); };
+  const addV = (c, v) => { const x = el("v"); x.textContent = String(v); c.appendChild(x); };
+  const putNum = (c, v) => { wipe(c); addV(c, v); };
+  const putStr = (c, s) => {
+    wipe(c); c.setAttribute("t", "inlineStr");
+    const is = el("is"), t = el("t"); t.setAttributeNS("http://www.w3.org/XML/1998/namespace", "xml:space", "preserve"); t.textContent = s;
+    is.appendChild(t); c.appendChild(is);
+  };
+  // a formula cell keeps its formula — only the value it last showed is refreshed, for viewers that don't recalculate (Protected View, previews)
+  const shown = (c, v) => { [...c.children].forEach(x => { if (x.localName === "v") c.removeChild(x); }); c.removeAttribute("t"); addV(c, v); };
+  const ext = new Map();   // sheet row → [ext cost, ext retail]
+  const fill = (rowEl, x, retail) => {
+    const n = x.off ? null : x.units, sp = bsSplit(n || 0);
+    const K = cellAt(rowEl, C.units, true); if (n == null) wipe(K); else putNum(K, n);
+    if (n != null && x.cost != null && C.cost >= 0) putNum(cellAt(rowEl, C.cost, true), x.cost);
+    const cost = x.cost != null ? x.cost : x.tjxCost, ec = (cost || 0) * sp.n, er = (retail || 0) * sp.n;
+    const calc = (ci, v) => { const c = cellAt(rowEl, ci); if (!fOf(c)) return false; shown(c, v); return true; };
+    // no split formulas on the form → write the split as plain units
+    if (!calc(C.tjm, sp.tjm) && C.tjm >= 0 && n != null) putNum(cellAt(rowEl, C.tjm, true), Math.round(sp.tjm));
+    if (!calc(C.mar, sp.mar) && C.mar >= 0 && n != null) putNum(cellAt(rowEl, C.mar, true), sp.n - Math.round(sp.tjm));
+    calc(C.rtjm, sp.tjmUp); calc(C.rmar, sp.marUp); calc(C.extc, ec); calc(C.extr, er);
+    if (er > 0) calc(C.mu, (er - ec) / er);
+    ext.set(+rowEl.getAttribute("r"), [ec, er]);
+  };
+  p.tjx.forEach(x => { const r = rowEls.get(x.row); if (r) fill(r, x, x.retail); });
+  // rows past the end of the form are copied from the row above; a shared formula is spelled out for the new row
+  const masters = new Map();
+  [...doc.getElementsByTagNameNS(SS_NS, "f")].forEach(f => {
+    if (f.getAttribute("t") === "shared" && f.textContent) masters.set(f.getAttribute("si"), { text:f.textContent, row:+f.parentNode.getAttribute("r").replace(/\D+/g, "") });
+  });
+  const blankCols = [C.style, C.fvsn, C.cat, C.desc, C.color, C.units, C.cost, C.retail];
+  const clone = n => {
+    const src = rowEls.get(n - 1); if (!src) throw new Error("Row " + (n - 1) + " of the form is missing");
+    const r = src.cloneNode(true); r.setAttribute("r", String(n));
+    [...r.children].forEach(c => {
+      const ci = colOf(c), f = fOf(c);
+      c.setAttribute("r", X.encode_col(ci) + n);
+      if (!f){ if (blankCols.indexOf(ci) >= 0) wipe(c); return; }
+      const m = f.getAttribute("t") === "shared" && !f.textContent ? masters.get(f.getAttribute("si")) : null;
+      const text = m ? m.text : f.textContent, at = m ? m.row : n - 1;
+      ["t", "si", "ref"].forEach(a => f.removeAttribute(a));
+      if (text) f.textContent = text.replace(new RegExp("(^|[^A-Za-z0-9_.$])(\\$?[A-Z]{1,3})" + at + "(?!\\d)", "g"), "$1$2" + n);
+      else c.removeChild(f);
+    });
+    sd.insertBefore(r, [...sd.children].find(e => +e.getAttribute("r") > n) || null);
+    rowEls.set(n, r);
+    return r;
+  };
+  let n = b.last, added = 0;
+  p.extra.forEach(x => {
+    if (x.off) return;
+    const r = rowEls.get(++n) || clone(n);
+    putStr(cellAt(r, C.style, true), x.style);
+    if (C.desc >= 0 && x.desc) putStr(cellAt(r, C.desc, true), x.desc);
+    fill(r, x, null); added++;
+  });
+  const dim = doc.getElementsByTagNameNS(SS_NS, "dimension")[0], dm = dim && /^([A-Z]+\d+:[A-Z]+)(\d+)$/.exec(dim.getAttribute("ref") || "");
+  if (dm && n > +dm[2]) dim.setAttribute("ref", dm[1] + n);
+  // totals above the header: SUM of EXT COST / EXT RETAIL, and the margin worked out from the two
+  const tops = new Map();
+  for (let pass = 0; pass < 2; pass++) rowEls.forEach((rowEl, rn) => {
+    if (rn > b.hi + 1) return;
+    [...rowEl.children].forEach(c => {
+      const f = fOf(c), t = f ? f.textContent.replace(/\s+/g, "") : "";
+      const s = /^SUM\(([A-Z]+)(\d+):\1(\d+)\)$/.exec(t), q = /^\(([A-Z]+\d+)-([A-Z]+\d+)\)\/\1$/.exec(t);
+      if (!pass && s){
+        const ci = X.decode_col(s[1]), i = ci === C.extc ? 0 : ci === C.extr ? 1 : -1; if (i < 0) return;
+        let sum = 0; ext.forEach((v, r) => { if (r >= +s[2] && r <= +s[3]) sum += v[i]; });
+        shown(c, sum); tops.set(c.getAttribute("r"), sum);
+      }
+      if (pass && q && tops.get(q[1]) > 0 && tops.has(q[2])) shown(c, (tops.get(q[1]) - tops.get(q[2])) / tops.get(q[1]));
+    });
+  });
+  zip.file(path, '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n' + new XMLSerializer().serializeToString(doc).replace(/^<\?xml[^>]*\?>\s*/, ""));
+  // Excel works every formula out again when it opens the file; the stale calculation order list is dropped so it builds a new one
+  zip.file("xl/workbook.xml", wbx.replace(/<calcPr\b([^>]*?)\s*\/>/, (m, a) => /fullCalcOnLoad/.test(a) ? m : "<calcPr" + a + ' fullCalcOnLoad="1"/>'));
+  if (zip.file("xl/calcChain.xml")){
+    zip.remove("xl/calcChain.xml");
+    zip.file("xl/_rels/workbook.xml.rels", relx.replace(/<Relationship\b[^>]*calcChain[^>]*\/>/, ""));
+    zip.file("[Content_Types].xml", (await read("[Content_Types].xml")).replace(/<Override\b[^>]*calcChain[^>]*\/>/, ""));
+  }
+  const blob = await zip.generateAsync({ type:"blob", compression:"DEFLATE", mimeType:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  return { blob, tjx:p.tjx.filter(x => !x.off).length, added, lastRow:n };
+}
+async function downloadBest(){
+  const b = S.bs; if (!b || S.busy) return;
+  S.busy = true;
+  const btn = $("#bsGo"); if (btn){ btn.disabled = true; btn.textContent = "Building the file…"; }
+  try {
+    if (typeof JSZip === "undefined") throw new Error("Zip library did not load (cdnjs blocked?)");
+    const r = await buildBest(), m = /^(.*?)(\.xls[xm])?$/i.exec(b.file), name = m[1] + " - Metro1 ATS" + (m[2] || ".xlsx");
+    saveBlob(r.blob, name);
+    b.err = false; b.note = "Downloaded " + name + " — " + r.tjx + " TJX rows filled, " + r.added + " styles added below them (through row " + r.lastRow + ").";
+  } catch(e){ console.error(e); b.err = true; b.note = "Could not build the file — " + errMsg(e); }
+  S.busy = false;
+  renderBest();
+}
+
 /* ============================== PHOTOS ============================== */
 /* S.photos: key → url | null (confirmed none) | undefined (loading) | "" (lookup failed — treated as unknown) */
 async function loadPhotos(keys){
@@ -1477,6 +1711,7 @@ function visibleRows(){
       case "missing":  return !cellStr(st.desc) || r.ph === null;
       case "reorder":  return r.cv.st === "reorder";
       case "lowre":    return r.cv.st === "reorder" || r.cv.st === "low";
+      case "bsoff":    return !!st.bsx;
     }
     return true;
   });
@@ -2016,6 +2251,8 @@ function renderDrawer(){
         ev.map(e => "<tr><td>" + fmtD(e[0]) + "</td><td>" + (KIND[e[1]] || e[1]) + '</td><td class="n">' + fmt0(e[2]) + "</td><td>" +
           (S.inv.date && e[0] < S.inv.date ? '<span class="neg">Overdue</span>' : "") + "</td></tr>").join("") + "</tbody></table>" : "")
     : '<div class="hint">' + (S.inv ? "Not in the latest stock file." : "Drop the TJX info file to show on hand, incoming and reorder status.") + "</div>") + "</div>";
+  h += '<div class="sec"><span class="lbl">TJX Best Sellers report</span><label class="dw-chk"><input type="checkbox" id="dwBsx"' + (st.bsx ? " checked" : "") +
+    '>✕ Leave this style off the report</label></div>';
   if (a) h += '<div class="sec"><span class="lbl">By week · ' + S.year + (S.cust === "All" ? "" : " · " + esc(S.cust)) + '</span><div class="chart" style="padding:0">' +
     barSvg(a.wsh, a.wop, wkLabels(), wkTicks(), todayAt("week"), 440, 130) + "</div></div>";
   const custOk = l => S.cust === "All" || l[0] === S.cust;
@@ -2308,8 +2545,11 @@ function wire(){
     if (e.target.closest("[data-dismiss]")){ $("#impSt").className = "imp-st"; return; }
     if (e.target.id === "repSave") saveReport();
     if (e.target.id === "repDiscard"){ S.pending = null; $("#impSt").className = "imp-st"; }
+    if (e.target.id === "bsGo") downloadBest();
+    if (e.target.id === "bsClose"){ S.bs = null; $("#impSt").className = "imp-st"; }
   });
   $("#impSt").addEventListener("change", e => {
+    if (e.target.classList.contains("bsx")){ setBestOff(e.target.dataset.k, e.target.checked, e.target.dataset.s); return; }
     if (e.target.id === "repDate" && S.pending){ S.pending.date = e.target.value; $("#repWarn").textContent = repWarn(e.target.value); const sn = $("#shipNote"); if (sn) sn.textContent = shipNote(e.target.value); }
   });
   $("#imgPick").onchange = () => { const f = $("#imgPick").files[0]; if (f && imgTarget) uploadImage(imgTarget, f); };
@@ -2469,6 +2709,7 @@ function wire(){
     if (e.target.closest("#addField")){ addField(); return; }
     const pic = e.target.closest("[data-pic]"); if (pic) pickImage(pic.dataset.pic);
   });
+  dw.addEventListener("change", e => { if (e.target.id === "dwBsx" && S.drawer) setBestOff(S.drawer, e.target.checked, dwStyle()); });
   dw.addEventListener("keydown", e => { if (e.key === "Enter" && e.target.id === "newField") addField(); });
   addEventListener("keydown", e => { if (e.key === "Escape" && S.drawer) closeDrawer(); });
   addEventListener("beforeunload", e => { if (viewDirty) pushView(); if (hasPend() || S.saving){ flushStyles(); e.preventDefault(); e.returnValue = ""; } });
